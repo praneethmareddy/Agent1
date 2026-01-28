@@ -1,0 +1,34 @@
+def executor_node(state: AgentState) -> AgentState:
+    tools = list_tools()
+
+    prompt = (
+        "You are an autonomous execution agent.\n\n"
+        f"Goal:\n{state['goal']}\n\n"
+        f"Plan:\n{state['plan']}\n\n"
+        f"History:\n{state['messages']}\n\n"
+        f"Available tools:\n{tools}\n\n"
+        "Rules:\n"
+        "- Execute ONE step at a time\n"
+        "- Use ONLY available tools\n"
+        "- When finished, return tool=done\n"
+        "- Respond with STRICT JSON ONLY\n"
+        "- NO explanations\n"
+        "- NO markdown\n\n"
+        "JSON format:\n"
+        '{"tool": "<tool_name|done>", "args": {}}'
+    )
+
+    raw = llm.invoke(prompt).content.strip()
+
+    # 🔥 HARD SAFETY NET
+    try:
+        action = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError(f"Executor returned invalid JSON:\n{raw}")
+
+    if action["tool"] == "done":
+        state["done"] = True
+        return state
+
+    state["messages"].append(action)
+    return state
