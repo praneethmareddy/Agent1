@@ -1,34 +1,331 @@
-def executor_node(state: AgentState) -> AgentState:
-    tools = list_tools()
-
-    prompt = (
-        "You are an autonomous execution agent.\n\n"
-        f"Goal:\n{state['goal']}\n\n"
-        f"Plan:\n{state['plan']}\n\n"
-        f"History:\n{state['messages']}\n\n"
-        f"Available tools:\n{tools}\n\n"
-        "Rules:\n"
-        "- Execute ONE step at a time\n"
-        "- Use ONLY available tools\n"
-        "- When finished, return tool=done\n"
-        "- Respond with STRICT JSON ONLY\n"
-        "- NO explanations\n"
-        "- NO markdown\n\n"
-        "JSON format:\n"
-        '{"tool": "<tool_name|done>", "args": {}}'
-    )
-
-    raw = llm.invoke(prompt).content.strip()
-
-    # 🔥 HARD SAFETY NET
-    try:
-        action = json.loads(raw)
-    except json.JSONDecodeError:
-        raise ValueError(f"Executor returned invalid JSON:\n{raw}")
-
-    if action["tool"] == "done":
-        state["done"] = True
-        return state
-
-    state["messages"].append(action)
-    return state
+{
+  "nbformat": 4,
+  "nbformat_minor": 5,
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "language": "python",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.10"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "# LangGraph + MCP + Ollama\n",
+        "## PLAN → USER LOOP → ACT Autonomous Agent\n",
+        "\n",
+        "- PLAN can be refined infinitely\n",
+        "- ACT runs only after approval\n",
+        "- Real filesystem execution\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "!pip install -U langgraph langchain langchain-ollama mcp"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "from typing import TypedDict, List, Dict\n",
+        "from langgraph.graph import StateGraph, END\n",
+        "from langchain_ollama import ChatOllama\n",
+        "import os, json"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "llm = ChatOllama(model=\"gpt-oss:20b\", temperature=0)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Agent State"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "class AgentState(TypedDict):\n",
+        "    goal: str\n",
+        "    plan: List[str]\n",
+        "    messages: List[Dict]\n",
+        "    done: bool"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## MCP Filesystem Tools (Correct & Safe)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "from mcp.server.fastmcp import FastMCP\n",
+        "\n",
+        "BASE_DIR = \"/tmp/mcp_workspace\"\n",
+        "os.makedirs(BASE_DIR, exist_ok=True)\n",
+        "\n",
+        "mcp = FastMCP(\"filesystem\")\n",
+        "\n",
+        "# OUR OWN TOOL REGISTRY (IMPORTANT)\n",
+        "TOOLS = {}\n",
+        "\n",
+        "def register_tool(fn):\n",
+        "    TOOLS[fn.__name__] = fn\n",
+        "    return mcp.tool()(fn)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "@register_tool\n",
+        "def read_file(path: str) -> str:\n",
+        "    with open(os.path.join(BASE_DIR, path), \"r\") as f:\n",
+        "        return f.read()\n",
+        "\n",
+        "@register_tool\n",
+        "def write_file(path: str, content: str) -> str:\n",
+        "    with open(os.path.join(BASE_DIR, path), \"w\") as f:\n",
+        "        f.write(content)\n",
+        "    return \"ok\""
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "def call_tool(name: str, args: dict):\n",
+        "    if name not in TOOLS:\n",
+        "        raise ValueError(f\"Unknown tool: {name}\")\n",
+        "    return TOOLS[name](**args)"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Planner Node (PLAN MODE)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "def planner_node(state: AgentState) -> AgentState:\n",
+        "    prompt = f\"\"\"\n",
+        "You are an AI planner.\n",
+        "\n",
+        "User request:\n",
+        "{state['goal']}\n",
+        "\n",
+        "Current plan:\n",
+        "{state['plan']}\n",
+        "\n",
+        "Rules:\n",
+        "- If no plan exists, create one\n",
+        "- If plan exists, update only requested parts\n",
+        "- Do NOT execute anything\n",
+        "- Output numbered steps only\n",
+        "\"\"\"\n",
+        "\n",
+        "text = llm.invoke(prompt).content\n",
+        "state['plan'] = [l.strip() for l in text.splitlines() if l.strip()]\n",
+        "state['done'] = False\n",
+        "return state"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Executor Node (ACT MODE)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "def executor_node(state: AgentState) -> AgentState:\n",
+        "    prompt = f\"\"\"\n",
+        "You are an autonomous executor.\n",
+        "\n",
+        "Plan:\n",
+        "{state['plan']}\n",
+        "\n",
+        "History:\n",
+        "{state['messages']}\n",
+        "\n",
+        "Available tools:\n",
+        "{list(TOOLS.keys())}\n",
+        "\n",
+        "Respond ONLY in JSON:\n",
+        "{{\"tool\": \"read_file | write_file | done\", \"args\": {{}}}}\n",
+        "\"\"\"\n",
+        "\n",
+        "raw = llm.invoke(prompt).content.strip()\n",
+        "action = json.loads(raw)\n",
+        "\n",
+        "if action['tool'] == 'done':\n",
+        "    state['done'] = True\n",
+        "    return state\n",
+        "\n",
+        "state['messages'].append(action)\n",
+        "return state"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "def tool_node(state: AgentState) -> AgentState:\n",
+        "    action = state['messages'][-1]\n",
+        "    result = call_tool(action['tool'], action.get('args', {}))\n",
+        "    state['messages'].append({'observation': result})\n",
+        "    return state"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Build PLAN Graph"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "plan_graph = StateGraph(AgentState)\n",
+        "plan_graph.add_node(\"planner\", planner_node)\n",
+        "plan_graph.set_entry_point(\"planner\")\n",
+        "plan_graph.add_edge(\"planner\", END)\n",
+        "plan_app = plan_graph.compile()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Build ACT Graph"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "act_graph = StateGraph(AgentState)\n",
+        "act_graph.add_node(\"executor\", executor_node)\n",
+        "act_graph.add_node(\"tool\", tool_node)\n",
+        "act_graph.set_entry_point(\"executor\")\n",
+        "act_graph.add_conditional_edges(\n",
+        "    \"executor\",\n",
+        "    lambda s: END if s['done'] else 'tool'\n",
+        ")\n",
+        "act_graph.add_edge(\"tool\", \"executor\")\n",
+        "act_app = act_graph.compile()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## PLAN MODE (User reviews & edits)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "state = {\n",
+        "    'goal': 'Read x1.txt and x2.txt and write combined summary to summary.txt',\n",
+        "    'plan': [],\n",
+        "    'messages': [],\n",
+        "    'done': False\n",
+        "}\n",
+        "\n",
+        "state = plan_app.invoke(state)\n",
+        "state['plan']"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## USER MODIFIES PLAN"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "state['goal'] = 'Change summary.txt to summ.txt'\n",
+        "state = plan_app.invoke(state)\n",
+        "state['plan']"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## ACT MODE (Autonomous Execution)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "state = act_app.invoke(state)\n",
+        "state['messages']"
+      ]
+    }
+  ]
+}
